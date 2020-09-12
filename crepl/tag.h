@@ -1,0 +1,1 @@
+enum tag_e { func_tag, decl_tag, stmt_tag };

@@ -1,0 +1,156 @@
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body, html { margin: 0; padding: 0; }
+canvas { width: 100%; height: 20em; }
+audio { width: 100%; }
+#container { position: absolute; bottom: 0; width: 100%; }
+#cover { position: absolute; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.5); }
+</style>
+</head>
+
+<body>
+<div id="container">
+<div id="cover" onmousedown='this.hidden = true'></div>
+<canvas></canvas>
+<audio controls></audio>
+</div>
+
+<script>
+const audio = document.querySelector('audio');
+const canvas = document.querySelector('canvas');
+const container = document.querySelector('#container');
+
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+const audioContext = new AudioContext();
+let source = null;
+let playBuf = null;
+let mousedown = 1;
+let focused = false;
+
+const dpr = window.devicePixelRatio || 1;
+canvas.width = canvas.offsetWidth * dpr;
+canvas.height = (canvas.offsetHeight * 2) * dpr;
+const ctx = canvas.getContext('2d');
+ctx.scale(dpr, dpr);
+
+const mediaSource = new MediaSource();
+audio.src = URL.createObjectURL(mediaSource);
+
+const fetchBuf = () => fetch('testaudio.webm')
+	.then(res => res.arrayBuffer())
+	.then(buf => {
+		let sourceBuffer = mediaSource.addSourceBuffer('audio/webm');
+		sourceBuffer.addEventListener('updateend', () => {
+			mediaSource.endOfStream();
+		});
+		sourceBuffer.appendBuffer(buf);
+		return audioContext.decodeAudioData(buf);
+	})
+	.then(buf => playBuf = buf)
+	.then(buf => {
+		if (buf.numberOfChannels == 0) { return; }
+		visBuf = [];
+		for(var i=0; i < buf.numberOfChannels; i++) {
+			visBuf.push(visualize(buf.getChannelData(i), canvas.width));
+		}
+	});
+
+const visualize = (data, n0) => {
+	let n = Math.min(n0, data.length);
+	let bucket = Math.floor(data.length/n);
+	let ymax = 0;
+	let ys = [];
+	for (var i=0; i+1 < n; i++) {
+		let minmax = data
+			.slice(i*bucket, Math.min((i+1)*bucket, data.length-1))
+			.reduce((acc, val) => acc = [Math.min(acc[0], val), Math.max(acc[1], val)], [0, 0]);
+		ymax = Math.max(ymax, -minmax[0], minmax[1]);
+		ys.push(minmax);
+	}
+	let yscale = (ymax != 0 ? 1 / ymax : 1);
+	for (var i=0; i < ys.length; i++) {
+		ys[i][0] *= yscale;
+		ys[i][1] *= yscale;
+	}
+	return ys;
+};
+
+const drawWaveform = (data, width, height) => {
+	ctx.beginPath();
+	ctx.moveTo(0, 0);
+	ctx.lineTo(width, 0);
+	ctx.closePath();
+	ctx.stroke();
+
+	let xs = width / data.length;
+	let ys = height / 2;
+	for (var i=0; i < data.length; i++) {
+		let x = Math.floor(i * xs);
+		ctx.beginPath();
+		ctx.moveTo(x, data[i][0] * ys);
+		ctx.lineTo(x, data[i][1] * ys);
+		ctx.closePath();
+		ctx.stroke();
+	}
+};
+
+// PERF: this page uses *a lot* of cpu, and I think it's for rendering...
+const draw = () => {
+	// clear
+	ctx.strokeStyle = 'grey';
+	ctx.fillStyle = 'white';
+	ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+	// draw channel waveforms
+	if (playBuf != null && playBuf.numberOfChannels > 0) {
+		let step = canvas.height / playBuf.numberOfChannels;
+		let y = Math.round(step / 2);
+		ctx.translate(0, y);
+		step = Math.round(step);
+		for (var i=0; i < playBuf.numberOfChannels; i++) {
+			drawWaveform(visBuf[i], canvas.width, step);
+			ctx.translate(0, step);
+			y += step;
+		}
+		ctx.translate(0, -y);
+	}
+
+	// draw cursor
+	let x = audio.currentTime * canvas.width / audio.duration;
+	ctx.beginPath();
+	ctx.moveTo(x, 0);
+	ctx.lineTo(x, canvas.height);
+	ctx.closePath();
+	ctx.stroke();
+
+	let frame = requestAnimationFrame(draw);
+}
+
+const canvasSeek = ev => {
+	const rect = canvas.getBoundingClientRect();
+	const x = ev.clientX - rect.left;
+	//const y = ev.clientY - rect.top;
+	audio.currentTime = (x / rect.width) * audio.duration;
+};
+
+const keyDown = ev => {
+	if (focused) {
+		switch (ev.key) {
+		case ' ': if (audio.paused) { audio.play() } else { audio.pause() }
+		}
+	}
+}
+
+window.onload = () => { fetchBuf(); draw(); }
+canvas.addEventListener('mousedown', canvasSeek);
+canvas.addEventListener('mousedown', () => mousedown++);
+canvas.addEventListener('mouseup', () => mousedown--);
+canvas.addEventListener('mousemove', ev => { if (mousedown > 0) { canvasSeek(ev); } });
+container.addEventListener('mousedown', _ => focused = true);
+document.addEventListener('keydown', keyDown);
+
+</script>
+</body>
+</html>
