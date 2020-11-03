@@ -11,3 +11,4 @@ wayland-protocols = { version = "0.28.0", features = ["unstable_protocols", "cli
 wayland-client = "0.28.0"
 libc = "0.2.79"
 nix = "0.19.0"
+rusttype = "0.9.2"
