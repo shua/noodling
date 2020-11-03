@@ -1,5 +1,5 @@
 [package]
-name = "wlr-shlayer"
+name = "wl"
 version = "0.1.0"
 authors = ["shua <itis@isthisa.email>"]
 edition = "2018"

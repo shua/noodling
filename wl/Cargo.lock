@@ -187,7 +187,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wlr-shlayer"
+name = "wl"
 version = "0.1.0"
 dependencies = [
  "libc",
