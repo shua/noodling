@@ -204,7 +204,7 @@ impl Data {
                 if i > border
                     && ((i - border) % (bw + border)) < bw
                     && j > border
-                    && j < border + bw
+                    && j < border + bh
                 {
                     // inside button
                     shm[(i, j)] = 0xdd222222;
@@ -419,10 +419,12 @@ fn init_registry(display: &Display, event_queue: &mut EventQueue) -> Option<Regi
 }
 
 fn main() {
+    // todo: read options in from stdin
+    // todo: read config args in from process args
     let cfg = Config::new(
         vec!["shutdown".into(), "restart".into(), "hibernate".into()],
-        (400, 400),
-        10,
+        (300, 300),
+        30,
     );
 
     let display = Display::connect_to_env().expect("failed to connect to display");
