@@ -119,7 +119,7 @@ struct Surface {
     wl: Main<WlSurface>,
     xdg: Main<XdgSurface>,
     toplevel: Main<XdgToplevel>,
-    buffer_committed: bool,
+    committed: bool,
     configured: bool,
 }
 
@@ -198,6 +198,16 @@ impl Data {
             button_dim: (bw, bh),
             ..
         } = self.cfg;
+
+        let mut focus: Option<usize> = None;
+        if let (Some((x, y)), Some(wl_pointer::ButtonState::Pressed)) = (self.ptr.pos, self.ptr.btn)
+        {
+            let (x, y) = (x.ceil() as usize, y.ceil() as usize);
+            if y >= border && y < border + bh && x >= border && (x - border) % (bw + border) < bw {
+                focus = Some((x - border) / (bw + border));
+            }
+        }
+
         shm.clear(0x22222222);
         for i in 0..shm.width {
             for j in 0..shm.height {
@@ -207,7 +217,11 @@ impl Data {
                     && j < border + bh
                 {
                     // inside button
-                    shm[(i, j)] = 0xdd222222;
+                    shm[(i, j)] = if Some((i - border) / (bw + border)) == focus {
+                        0xdd444444
+                    } else {
+                        0xdd222222
+                    }
                 }
             }
         }
@@ -220,8 +234,8 @@ impl Data {
             let top = border;
             let bottom = top + bh;
 
-            let offset_x : i32 = left as i32 - g.width.ceil() as i32 / 2 + bw as i32 / 2;
-            let offset_y : i32 = top as i32 - g.height.ceil() as i32 / 2 + bh as i32 / 2;
+            let offset_x: i32 = left as i32 - g.width.ceil() as i32 / 2 + bw as i32 / 2;
+            let offset_y: i32 = top as i32 - g.height.ceil() as i32 / 2 + bh as i32 / 2;
 
             let (mut btn_boundaries, mut buf_boundaries) = (false, false);
             g.render(|x, y, v| {
@@ -501,6 +515,7 @@ fn main() {
 
         if data.surface.is_none() {
             eprintln!("setting xdg_surface");
+            let (width, height) = data.cfg.window_dim;
             let wl = data.registry.compositor.create_surface();
             let xdg = data.registry.wmbase.get_xdg_surface(&wl.detach());
             let toplevel = xdg.get_toplevel();
@@ -510,12 +525,7 @@ fn main() {
             filter2!(toplevel, data,
                 xdg_toplevel::Event::Close => data.cfg.should_close = true
             );
-            xdg.set_window_geometry(
-                0,
-                0,
-                data.cfg.window_dim.0 as i32,
-                data.cfg.window_dim.1 as i32,
-            );
+            xdg.set_window_geometry(0, 0, width as i32, height as i32);
             filter2!(xdg, data,
                 xdg_surface::Event::Configure { serial } => {
                     eprintln!("xdg_surface Configure");
@@ -529,7 +539,7 @@ fn main() {
                 wl,
                 xdg,
                 toplevel,
-                buffer_committed: false,
+                committed: false,
                 configured: false,
             });
         }
@@ -541,10 +551,16 @@ fn main() {
                 data.ptr.btn_prev = data.ptr.btn;
                 data.render();
 
-                if let (Some(wl_pointer::ButtonState::Pressed), Some((x, y))) = (data.ptr.btn, data.ptr.pos) {
+                if let (Some((x, y)), Some(wl_pointer::ButtonState::Released)) =
+                    (data.ptr.pos, data.ptr.btn)
+                {
                     let (x, y) = (x.ceil() as usize, y.ceil() as usize);
-                    let (border, bw, bh) = (data.cfg.border, data.cfg.button_dim.0, data.cfg.button_dim.1);
-                    if y >= border && y < border + bh && x >= border && (x - border) % (border + bw) < bw {
+                    let (border, (bw, bh)) = (data.cfg.border, data.cfg.button_dim);
+                    if y >= border
+                        && y < border + bh
+                        && x >= border
+                        && (x - border) % (border + bw) < bw
+                    {
                         let i = (x - border) / (border + bw);
                         if let Some(opt) = data.cfg.options.get(i) {
                             println!("{}", opt);
@@ -557,7 +573,7 @@ fn main() {
                     let (width, height) = data.cfg.window_dim;
                     eprintln!("Damage 0..{} 0..{}", width, height);
                     surface.wl.damage(0, 0, width as i32, height as i32);
-                    surface.buffer_committed = false;
+                    surface.committed = false;
                 }
             }
         }
@@ -568,7 +584,7 @@ fn main() {
                 @
                 Surface {
                     configured: true,
-                    buffer_committed: false,
+                    committed: false,
                     ..
                 },
             ),
@@ -579,7 +595,7 @@ fn main() {
             surface.wl.attach(Some(&buffer.wl), 0, 0);
             buffer.locked = true;
             surface.wl.commit();
-            surface.buffer_committed = true;
+            surface.committed = true;
         }
     }
 }
