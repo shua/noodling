@@ -10,9 +10,11 @@ use wayland_client::protocol::{
 };
 use wayland_client::EventQueue;
 use wayland_client::{self, Display, Filter, GlobalManager, Main};
+use wayland_protocols::wlr::unstable::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{self as layer_shell, Layer, ZwlrLayerShellV1 as LayerShell},
+    zwlr_layer_surface_v1::{self as layer_surface, ZwlrLayerSurfaceV1 as LayerSurface},
+};
 use wayland_protocols::xdg_shell::client::{
-    xdg_surface::{self, XdgSurface},
-    xdg_toplevel::{self, XdgToplevel},
     xdg_wm_base::{self, XdgWmBase},
 };
 
@@ -65,13 +67,13 @@ mod conf {
             }
         }
 
-        pub fn button_bounds(&self, i: usize) -> (usize, usize, usize, usize) {
+        pub fn button_bounds(&self, i: usize) -> (i32, i32, i32, i32) {
             let (border, (bw, bh)) = (self.border, self.button_dim);
             let left = border + i * (bw + border);
             let right = left + bw;
             let top = border;
             let bottom = top + bh;
-            (left, right, top, bottom)
+            (left as i32, right as i32, top as i32, bottom as i32)
         }
     }
 
@@ -84,24 +86,24 @@ mod conf {
     impl FromStr for Argb {
         type Err = anyhow::Error;
         fn from_str(s: &str) -> Result<Self> {
-            if s.starts_with('#') && s[1..].chars().all(char::is_numeric) {
-                let s = &s[1..];
-                match s.len() {
-                    8 => Ok(Argb(s.parse::<u32>()?)),
-                    6 => Ok(Argb(s.parse::<u32>()? | 0xff000000)),
-                    3 | 4 => {
-                        /* 0xff is alpha for 3 digits, shifted off the big end for 4 digits */
-                        let mut n: u32 = 0xff;
-                        for d in s.as_bytes() {
-                            n <<= 8;
-                            n |= ((d - b'0') * 0x11) as u32;
-                        }
-                        Ok(Argb(n))
-                    }
-                    _ => return Err(anyhow!(ARGB_FORMAT_MSG))?,
-                }
-            } else {
-                Err(anyhow!(ARGB_FORMAT_MSG))?
+            if !s.starts_with('#') || !s[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(anyhow!(ARGB_FORMAT_MSG));
+            }
+
+            let s = &s[1..];
+            let dup = |s: &str| {
+                s.chars().fold(String::new(), |mut s, c| {
+                    s.push(c);
+                    s.push(c);
+                    s
+                })
+            };
+            match s.len() {
+                8 => Ok(Argb(u32::from_str_radix(s, 16)?)),
+                6 => Ok(Argb(u32::from_str_radix(s, 16)? | 0xff000000)),
+                4 => Ok(Argb(u32::from_str_radix(&dup(s), 16)?)),
+                3 => Ok(Argb(u32::from_str_radix(&dup(s), 16)? | 0xff000000)),
+                _ => Err(anyhow!(ARGB_FORMAT_MSG)),
             }
         }
     }
@@ -171,25 +173,21 @@ mod font {
 
     impl<'f> Glyphs<'f> {
         pub fn render(self, mut d: impl FnMut(usize, usize, u8)) {
-            let width = self.width.ceil();
-            let height = self.height.ceil();
+            let (width, height) = (self.width.ceil(), self.height.ceil());
 
-            for g in self.glyphs {
-                let bb = g.pixel_bounding_box();
-                if bb.is_none() {
-                    continue;
-                }
-                let bb = bb.unwrap();
-
-                g.draw(|x, y, v| {
-                    let v = (v * 255.0).ceil() as u8;
-                    let x = x as i32 + bb.min.x;
-                    let y = y as i32 + bb.min.y;
-                    if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
-                        d(x as usize, y as usize, v);
-                    }
+            self.glyphs
+                .iter()
+                .filter_map(|g| g.pixel_bounding_box().map(|bb| (g, bb)))
+                .for_each(|(g, bb)| {
+                    g.draw(|x, y, v| {
+                        let v = (v * 255.0).ceil() as u8;
+                        let x = x as i32 + bb.min.x;
+                        let y = y as i32 + bb.min.y;
+                        if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
+                            d(x as usize, y as usize, v);
+                        }
+                    })
                 })
-            }
         }
     }
 }
@@ -200,6 +198,7 @@ struct Registry {
     seat: Main<WlSeat>,
     shm: Main<WlShm>,
     wmbase: Main<XdgWmBase>,
+    layer_shell: Main<LayerShell>,
 }
 
 #[derive(Debug, Default)]
@@ -214,8 +213,7 @@ struct Pointer {
 #[derive(Debug)]
 struct Surface {
     wl: Main<WlSurface>,
-    xdg: Main<XdgSurface>,
-    toplevel: Main<XdgToplevel>,
+    layer: Main<LayerSurface>,
     committed: bool,
     configured: bool,
 }
@@ -229,6 +227,7 @@ struct Data {
     shm_formats: Vec<wl_shm::Format>,
     buffer: ShmPixelBuffer,
     surface: Surface,
+    rendered: bool,
 }
 
 impl Data {
@@ -244,6 +243,7 @@ impl Data {
             },
             wl_pointer::Event::Leave { .. } => {
                 data.ptr.pos.take();
+                data.ptr.btn.take();
             },
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
                 data.ptr.pos.replace((surface_x, surface_y));
@@ -271,7 +271,8 @@ impl Data {
         let shmbuffer = create_shmbuffer(width, height, shm).expect("failed to create shm");
 
         let (width, height) = cfg.buttons_bounds();
-        let surface = Data::create_surface(width, height, &registry.compositor, wmbase);
+        let surface =
+            Data::create_surface(width, height, &registry.compositor, &registry.layer_shell);
 
         let mut data = Data {
             cfg,
@@ -281,6 +282,7 @@ impl Data {
             surface: surface,
             seat_cap: wl_seat::Capability::from_raw(0).unwrap(),
             shm_formats: vec![],
+            rendered: false,
         };
         data.render();
         data
@@ -290,30 +292,27 @@ impl Data {
         width: usize,
         height: usize,
         compositor: &Main<WlCompositor>,
-        wmbase: &Main<XdgWmBase>,
+        layer_shell: &Main<LayerShell>,
     ) -> Surface {
         let wl = compositor.create_surface();
-        let xdg = wmbase.get_xdg_surface(&wl.detach());
-        let toplevel = xdg.get_toplevel();
-        let appid = String::from("wlr-shlayer");
-        toplevel.set_title(appid.clone());
-        toplevel.set_app_id(appid);
-        filter!(toplevel, data,
-            xdg_toplevel::Event::Close => data.cfg.should_close = true
-        );
-        xdg.set_window_geometry(0, 0, width as i32, height as i32);
-        filter!(xdg, data,
-            xdg_surface::Event::Configure { serial } => {
-                data.surface.xdg.detach().ack_configure(serial);
+        let (width, height) = (width as i32, height as i32);
+        let namespace = String::from("wtmenu");
+        let layer = layer_shell.get_layer_surface(&wl.detach(), None, Layer::Overlay, namespace);
+        layer.set_size(width as u32, height as u32);
+        filter!(layer, data,
+            layer_surface::Event::Configure { serial, .. } => {
+                data.surface.layer.detach().ack_configure(serial);
                 data.surface.configured = true;
+            },
+            layer_surface::Event::Closed => {
+                data.cfg.should_close = true;
             }
         );
         wl.commit();
 
         Surface {
             wl,
-            xdg,
-            toplevel,
+            layer,
             committed: false,
             configured: false,
         }
@@ -326,12 +325,12 @@ impl Data {
         let shm = &mut self.buffer;
         let (bw, bh) = self.cfg.button_dim;
 
-        let focus = if let (Some((x, y)), Some(wl_pointer::ButtonState::Pressed)) =
-            (self.ptr.pos, self.ptr.btn)
-        {
-            self.cfg.in_button(x.ceil() as usize, y.ceil() as usize)
-        } else {
-            None
+        let focus = {
+            let cfg = &self.cfg;
+            (self.ptr.btn)
+                .filter(|s| s == &wl_pointer::ButtonState::Pressed)
+                .and(self.ptr.pos)
+                .and_then(|(x, y)| cfg.in_button(x.ceil() as usize, y.ceil() as usize))
         };
 
         for i in 0..shm.width {
@@ -348,27 +347,26 @@ impl Data {
             }
         }
 
+        let scale = |v: u8, s: u8| ((v as u32 * s as u32) / 255) as u8;
+        let (nf, sf) = (self.cfg.nf, self.cfg.sf);
+        let rendered = self.rendered;
         for i in 0..self.cfg.options.len() {
-            let g = self.cfg.font.glyphs(self.cfg.options.get(i).unwrap());
+            let opt = self.cfg.options.get(i).unwrap();
+            let g = self.cfg.font.glyphs(opt);
 
             let (left, right, top, bottom) = self.cfg.button_bounds(i);
 
-            let trans_x: i32 = max(
-                left as i32,
-                left as i32 - g.width.ceil() as i32 / 2 + bw as i32 / 2,
-            );
-            let trans_y: i32 = max(
-                top as i32,
-                top as i32 - g.height.ceil() as i32 / 2 + bh as i32 / 2,
-            );
+            let trans_x: i32 = max(left, left - (g.width.ceil() as i32 - bw as i32) / 2);
+            let trans_y: i32 = max(top, top - (g.height.ceil() as i32 - bh as i32) / 2);
 
             let (mut warn_btn, mut warn_buf) = (false, false);
             g.render(|x, y, v| {
                 let (x, y) = (x as i32 + trans_x, y as i32 + trans_y);
                 if x < 0 || x as usize >= shm.width || y < 0 || y as usize >= shm.height {
-                    if !warn_buf {
+                    if !rendered && !warn_buf {
                         eprintln!(
-                            "glyph exceeds buffer boundaries: {:?} {:?}",
+                            "glyph for {:?} exceeds buffer boundaries: {:?} {:?}",
+                            opt,
                             (x, y),
                             (shm.width, shm.height)
                         );
@@ -376,11 +374,11 @@ impl Data {
                     }
                     return;
                 }
-                let (x, y) = (x as usize, y as usize);
                 if x < left || x >= right || y < top || y >= bottom {
-                    if !warn_btn {
+                    if !rendered && !warn_btn {
                         eprintln!(
-                            "glyph exceeds button boundaries: {:?} {:?}",
+                            "glyph for {:?} exceeds button boundaries: {:?} {:?}",
+                            opt,
                             (x, y),
                             (left, right, top, bottom)
                         );
@@ -389,14 +387,26 @@ impl Data {
                     return;
                 }
 
-                let [a, r, g, b] = shm[(x, y)].to_be_bytes();
-                shm[(x, y)] = u32::from_be_bytes([a, max(r, v), max(g, v), max(b, v)]);
+                let pixi = (x as usize, y as usize);
+                let [a, rb, gb, bb] = shm[pixi].to_be_bytes();
+                let [_, rf, gf, bf] = if Some(i) == focus {
+                    sf.to_be_bytes()
+                } else {
+                    nf.to_be_bytes()
+                };
+                shm[pixi] = u32::from_be_bytes([
+                    a,
+                    max(rb, scale(v, rf)),
+                    max(gb, scale(v, gf)),
+                    max(bb, scale(v, bf)),
+                ]);
             });
         }
 
         let (ww, wh) = self.cfg.buttons_bounds();
         self.surface.wl.damage(0, 0, ww as i32, wh as i32);
         self.surface.committed = false;
+        self.rendered = true;
     }
 }
 
@@ -522,12 +532,16 @@ fn init_registry(display: &Display, event_queue: &mut EventQueue) -> Result<Regi
     let shm: Main<WlShm> = gm
         .instantiate_exact(1)
         .context("Failed to get shm handle")?;
+    let layer_shell: Main<LayerShell> = gm
+        .instantiate_range(2, 5)
+        .context("Failed to get layer shell handle")?;
 
     Ok(Registry {
         compositor,
         seat,
         wmbase,
         shm,
+        layer_shell,
     })
 }
 
@@ -548,8 +562,7 @@ fn parse_config(mut args: std::env::Args, stdin: std::io::StdinLock) -> Result<C
                 "-f" => {
                     font = font.or(Font::load(&arg)
                         .map_err(|err| eprintln!("failed to load font {}: {}", arg, err))
-                        .map(Some)
-                        .unwrap_or(None))
+                        .ok())
                 }
                 "-nf" => nf = arg.parse::<Argb>()?.0,
                 "-nb" => nb = arg.parse::<Argb>()?.0,
@@ -595,7 +608,6 @@ fn main() -> Result<()> {
 
     let display = Display::connect_to_env().context("failed to connect to display")?;
     let mut event_queue = display.create_event_queue();
-
     let registry = init_registry(&display, &mut event_queue)
         .context("failed to get necessary handles for registry")?;
     let mut data = Data::new(cfg, registry);
@@ -605,8 +617,12 @@ fn main() -> Result<()> {
             .dispatch(&mut data, |_, _, _| {})
             .context("An error occurred during event dispatch")?;
 
-        if data.ptr.frame && data.ptr.btn != data.ptr.btn_prev {
+        if data.ptr.frame
+            && (data.ptr.pos_prev.is_some() ^ data.ptr.pos.is_some()
+                || data.ptr.btn != data.ptr.btn_prev)
+        {
             data.ptr.btn_prev = data.ptr.btn;
+            data.ptr.pos_prev = data.ptr.pos;
             data.render();
 
             if let Some(opt) = (data.ptr.btn)
@@ -620,12 +636,7 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Surface {
-            configured: true,
-            committed: false,
-            ..
-        } = &mut data.surface
-        {
+        if data.surface.configured && !data.surface.committed {
             data.surface.wl.attach(Some(&data.buffer.wl), 0, 0);
             data.buffer.locked = true;
             data.surface.wl.commit();
